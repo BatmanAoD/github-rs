@@ -20,6 +20,7 @@ macro_rules! from {
         impl <'g> From<$f<'g>> for $i1<'g> {
             fn from(mut f: $f<'g>) -> Self {
                 use std::str::FromStr;
+                use hyper::Uri;
 
                 // This is borrow checking abuse and about the only
                 // time I'd do is_ok(). Essentially this allows us
@@ -37,8 +38,8 @@ macro_rules! from {
                                     .uri()
                                     .query()
                                     .is_some() { "&" } else { "?" };
-                            hyper::Uri::from_str(
-                                &format!("{}{}{}={}",
+                                Uri::from_str(
+                                    &format!("{}{}{}={}",
                                     req.get_mut().uri(),
                                     sep,
                                     $e1,
@@ -48,7 +49,7 @@ macro_rules! from {
                         });
                     match url {
                         Ok(u) => {
-                            *req.get_mut().uri_mut() = u;
+                            req.get_mut().set_uri(u);
                             f.request = Ok(req);
                         },
                         Err(e) => {
@@ -85,10 +86,10 @@ macro_rules! from {
                 if f.request.is_ok() {
                     // We've checked that this works
                     let mut req = f.request.unwrap();
-                    let url = url_join(req.borrow().uri(), $e2);
+                    let url = url_join(req.get_mut().uri(), $e2);
                     match url {
                         Ok(u) => {
-                            *req.get_mut().uri_mut() = u;
+                            req.get_mut().set_uri(u);
                             f.request = Ok(req);
                         },
                         Err(e) => {
@@ -117,28 +118,25 @@ macro_rules! from {
         }
         )*)*
     );
-    ($(@$t: ident => $p: expr)*) => (
+    ($(@$t: ident => $p: path)*) => (
         $(
         impl <'g> From<&'g Github> for $t<'g> {
             fn from(gh: &'g Github) -> Self {
-                use hyper::header::{ ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT };
-                let res = Request::builder().method($p)
-                    .uri("https://api.github.com")
-                    .body(hyper::Body::empty())
-                    .map_err(From::from)
-                    .and_then(|req| {
+                use std::result;
+                use hyper::mime::FromStrError;
+                let url = "https://api.github.com".parse::<Uri>();
+                let mime: result::Result<Mime, FromStrError> =
+                    "application/vnd.github.v3+json".parse();
+                match (url, mime) {
+                    (Ok(u), Ok(m)) => {
+                        let mut req = Request::new($p, u);
                         let token = String::from("token ") + &gh.token;
-                        HeaderValue::from_str(&token).map(|token| (req, token))
-                            .map_err(From::from)
-                    });
-                match res {
-                    Ok((mut req, token)) => {
                         {
                             let headers = req.headers_mut();
-                            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                            headers.insert(USER_AGENT, HeaderValue::from_static("github-rs"));
-                            headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3+json"));
-                            headers.insert(AUTHORIZATION, token);
+                            headers.set(ContentType::json());
+                            headers.set(UserAgent::new(String::from("github-rs")));
+                            headers.set(Accept(vec![qitem(m)]));
+                            headers.set(Authorization(token));
                         }
                         Self {
                             request: Ok(RefCell::new(req)),
@@ -147,9 +145,27 @@ macro_rules! from {
                             parameter: None,
                         }
                     }
-                    Err(err) => {
+                    (Err(u), Ok(_)) => {
                         Self {
-                            request: Err(err),
+                            request: Err(u.into()),
+                            core: &gh.core,
+                            client: &gh.client,
+                            parameter: None,
+                        }
+                    }
+                    (Ok(_), Err(e)) => {
+                        Self {
+                            request: Err(e.into()),
+                            core: &gh.core,
+                            client: &gh.client,
+                            parameter: None,
+                        }
+                    }
+                    (Err(u), Err(e)) => {
+                        Self {
+                            request: Err(u).chain_err(||
+                                format!("Mime failed to parse: {:?}", e)
+                            ),
                             core: &gh.core,
                             client: &gh.client,
                             parameter: None,
@@ -183,39 +199,99 @@ macro_rules! new_type {
 /// pipeline. If passed a type it creates the impl as well as it needs
 /// no extra functions.
 macro_rules! exec {
-    ($t: ident) => {
+    ($t: ident) => (
         impl<'a> Executor for $t<'a> {
             /// Execute the query by sending the built up request to GitHub.
             /// The value returned is either an error or the Status Code and
             /// Json after it has been deserialized. Please take a look at
             /// the GitHub documentation to see what value you should receive
             /// back for good or bad requests.
-            fn execute<T>(self) -> Result<(HeaderMap, StatusCode, Option<T>)>
-            where
-                T: DeserializeOwned,
+            fn execute<T>(self) -> Result<(Headers, StatusCode, Option<T>)>
+                where T: DeserializeOwned
             {
                 let mut core_ref = self.core.try_borrow_mut()?;
                 let client = self.client;
-                let work = client.request(self.request?.into_inner()).and_then(|res| {
-                    let header = res.headers().clone();
-                    let status = res.status();
-                    res.into_body()
-                        .fold(Vec::new(), |mut v, chunk| {
-                            v.extend(&chunk[..]);
-                            ok::<_, hyper::Error>(v)
-                        })
-                        .map(move |chunks| {
+                let work = client
+                    .request(self.request?.into_inner())
+                    .and_then(|res| {
+                        let header = res.headers().clone();
+                        let status = res.status();
+                        res.body().concat2().map(move |chunks| {
                             if chunks.is_empty() {
                                 Ok((header, status, None))
                             } else {
                                 Ok((header, status, Some(serde_json::from_slice(&chunks)?)))
                             }
                         })
-                });
+                    });
                 core_ref.run(work)?
             }
+
+            fn paginated_execute<T>(self) -> Result<Vec<(Headers, StatusCode, T)>>
+                where T: DeserializeOwned
+            {
+                use hyper::header::Link;
+                use hyper::Uri;
+                use std::str::FromStr;
+
+                let clone_req = |req: &Request| -> Request {
+                    let mut request = Request::new(req.method().to_owned(), req.uri().to_owned());
+                    request.set_uri(req.uri().to_owned());
+                    *request.headers_mut() = req.headers().to_owned();
+                    request
+                };
+
+                let client = self.client;
+                let work = move |req| {
+                    client
+                    .request(req)
+                    .and_then(|res| {
+                        let header = res.headers().clone();
+                        let status = res.status();
+                        res.body().concat2().map(move |chunks| {
+                            Ok((header, status, serde_json::from_slice::<Vec<T>>(&chunks)?))
+                        })
+                    })
+                };
+
+                let mut core_ref = self.core.try_borrow_mut()?;
+                let request = self.request?.into_inner();
+
+                let mut req = clone_req(&request);
+                let mut results = Vec::new();
+
+                match core_ref.run(work(request))? {
+                    Ok((header, status, body)) => {
+                        results.push((header.clone(), status, body));
+                        if let Some(link) = header.get::<Link>() {
+                           // We know the values because this is how github does pagination
+                           // so as long as we have a link header using indexing is fine here
+                           let mut next = link.values()[0].link().to_string();
+                           let last = link.values()[1].link().split("page=").last()
+                                          .unwrap().parse::<i32>().unwrap();
+                           for _ in 0 .. last {
+                               let mut request = clone_req(&req);
+                               req.set_uri(Uri::from_str(&next).unwrap());
+                               let (header, status, body) = core_ref.run(work(request))??;
+                               results.push((header.clone(), status, body));
+                               if let Some(link) = header.get::<Link>() {
+                                   next = link.values()[0].link().to_string();
+                               }
+                           }
+                        }
+                        let mut flat = Vec::new();
+                        for (headers, status, json) in results {
+                            for item in json {
+                                flat.push((headers.clone(), status.clone(), item));
+                            }
+                        }
+                        Ok(flat)
+                    },
+                    Err(e) => Err(e)
+                }
+            }
         }
-    };
+    );
 }
 
 /// Using a small DSL like macro generate an impl for a given type
@@ -240,10 +316,10 @@ macro_rules! impl_macro {
                     if self.request.is_ok() {
                         // We've checked that this works
                         let mut req = self.request.unwrap();
-                        let url = url_join(req.borrow().uri(), $e2);
+                        let url = url_join(req.get_mut().uri(), $e2);
                         match url {
                             Ok(u) => {
-                                *req.get_mut().uri_mut() = u;
+                                req.get_mut().set_uri(u);
                                 self.request = Ok(req);
                             },
                             Err(e) => {
@@ -283,10 +359,10 @@ macro_rules! func_client{
             if self.request.is_ok() {
                 // We've checked that this works
                 let mut req = self.request.unwrap();
-                let url = url_join(req.borrow().uri(), $e);
+                let url = url_join(req.get_mut().uri(), $e);
                 match url {
                     Ok(u) => {
-                        *req.get_mut().uri_mut() = u;
+                        req.get_mut().set_uri(u);
                         self.request = Ok(req);
                     },
                     Err(e) => {
@@ -304,24 +380,22 @@ macro_rules! imports {
     () => {
         use tokio_core::reactor::Core;
         #[cfg(feature = "rustls")]
-        type HttpsConnector = hyper_rustls::HttpsConnector<hyper::client::HttpConnector>;
+        use hyper_rustls::HttpsConnector;
         #[cfg(feature = "rust-native-tls")]
         use hyper_tls;
         #[cfg(feature = "rust-native-tls")]
         type HttpsConnector = hyper_tls::HttpsConnector<hyper::client::HttpConnector>;
-        use crate::errors::*;
-        use crate::util::url_join;
-        use futures::future::ok;
-        use futures::{Future, Stream};
         use hyper::client::Client;
-        use hyper::Request;
+        use hyper::client::Request;
         use hyper::StatusCode;
-        use hyper::{self, Body, HeaderMap};
+        use hyper::{Body, Headers};
+        use errors::*;
+        use futures::{Future, Stream};
+        use util::url_join;
         use serde::de::DeserializeOwned;
         use serde_json;
-        use std::cell::RefCell;
         use std::rc::Rc;
-
+        use std::cell::RefCell;
         use $crate::client::Executor;
     };
 }
